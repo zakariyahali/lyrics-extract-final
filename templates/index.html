@@ -31,10 +31,11 @@
             <div id="result">
                 <h2>Extracted Lyrics:</h2>
                 <pre id="lyrics"></pre>
-                <h2>Formatted Lyrics:</h2>
-                <pre id="formatted-lyrics"></pre>
+                <h2>Summary of the Transcribed Text:</h2>
+                <pre id="summary"></pre>
                 <h2>Generated Image:</h2>
-                <img id="generated-image" src="" alt="Generated Image" style="display: none;">
+                <img id="generated-image" src="" alt="Generated Image" style="display: none; max-width: 100%; height: auto;">
+                <p id="image-caption" style="display: none;">This is the image inspired by the lyrics</p>
             </div>
         </main>
     </div>
@@ -54,29 +55,24 @@
                     contentType: false,
                     success: function(response){
                         $('#lyrics').text(response.lyrics);
+                        $('#summary').text(response.summary);
 
-                        // Reformat lyrics
+                        // Generate image
                         $.ajax({
-                            url: '/reformat_lyrics/',
+                            url: '/generate_image/',
                             type: 'POST',
                             contentType: 'application/json',
-                            data: JSON.stringify({ lyrics: response.lyrics }),
-                            success: function(data){
-                                $('#formatted-lyrics').text(data.formatted_lyrics);
-
-                                // Generate image
-                                $.ajax({
-                                    url: '/generate_image/',
-                                    type: 'POST',
-                                    contentType: 'application/json',
-                                    data: JSON.stringify({ lyrics: data.formatted_lyrics }),
-                                    success: function(imageResponse){
-                                        $('#generated-image').attr('src', '/media/generated_image.png');
-                                        $('#generated-image').show();
-                                    }
-                                });
+                            data: JSON.stringify({ lyrics: response.summary }),
+                            success: function(imageResponse){
+                                $('#generated-image').attr('src', '/media/generated_image.png');
+                                $('#generated-image').show();
+                                $('#image-caption').show();
                             }
                         });
+                    },
+                    error: function(xhr, status, error) {
+                        $('#lyrics').text('Error extracting lyrics: ' + xhr.responseText);
+                        $('#summary').text('Error generating summary.');
                     }
                 });
             });

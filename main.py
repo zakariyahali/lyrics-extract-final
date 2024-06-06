@@ -11,10 +11,12 @@ from PIL import Image
 from dotenv import load_dotenv
 import logging
 import speech_recognition as sr
+import openai
 import requests
 
 # Load environment variables
 load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Initialize the app
 app = FastAPI()
@@ -37,6 +39,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Ensure the converted_files directory exists
+if not os.path.exists('converted_files'):
+    os.makedirs('converted_files')
+
 # Models
 class LyricsPayload(BaseModel):
     lyrics: str
@@ -48,36 +54,60 @@ def convert_mp3_to_wav(mp3_path, wav_path):
     audio.export(wav_path, format="wav")
     logging.info(f"Converted MP3 to WAV: {wav_path}")
 
-def transcribe_audio_to_text(wav_path, language='en-US'):
-    """Transcribe audio file to text using Google's speech recognition."""
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(wav_path) as source:
-        audio_data = recognizer.record(source)
-        try:
-            text = recognizer.recognize_google(audio_data, language=language)
-            return text
-        except sr.UnknownValueError:
-            logging.error("Could not understand the audio")
-            return "Sorry, could not understand the audio."
-        except sr.RequestError as e:
-            logging.error(f"Recognition request failed: {e}")
-            return f"Could not request results; {e}"
+def split_audio(wav_path, chunk_length_ms=60000):
+    """Split audio file into chunks of specified length (default is 60 seconds)."""
+    audio = AudioSegment.from_wav(wav_path)
+    chunks = [audio[i:i+chunk_length_ms] for i in range(0, len(audio), chunk_length_ms)]
+    return chunks
 
-def extract_lyrics_from_mp3(mp3_path, language='en-US'):
-    """Extract lyrics from an MP3 file."""
-    # Define paths
-    wav_path = mp3_path.replace(".mp3", ".wav")
+def transcribe_audio_chunk(chunk, chunk_index):
+    """Transcribe a single audio chunk using OpenAI's API."""
+    chunk_path = f"chunk_{chunk_index}.wav"
+    chunk.export(chunk_path, format="wav")
+
+    try:
+        with open(chunk_path, 'rb') as audio_file:
+            response = openai.Audio.transcribe(
+                model="whisper-1",
+                file=audio_file
+            )
+            text = response['text']
+    except Exception as e:
+        logging.error(f"An error occurred with chunk {chunk_index}: {e}")
+        text = ""
+    finally:
+        os.remove(chunk_path)  # Clean up the chunk file after processing
+    return text
+
+def transcribe_wav_to_text(wav_path):
+    """Transcribe WAV file to text using OpenAI's API by splitting into chunks."""
+    chunks = split_audio(wav_path)
+    full_text = ""
     
-    # Convert MP3 to WAV
-    convert_mp3_to_wav(mp3_path, wav_path)
+    for i, chunk in enumerate(chunks):
+        chunk_text = transcribe_audio_chunk(chunk, i)
+        full_text += chunk_text + " "
+    
+    logging.info(f"Transcribed Text: {full_text.strip()}")
+    return full_text.strip()
 
-    # Transcribe audio to text
-    if os.path.exists(wav_path):
-        lyrics = transcribe_audio_to_text(wav_path, language)
-        os.remove(wav_path)  # Clean up the WAV file after processing
-        return lyrics
-    else:
-        return "Failed to convert MP3 to WAV."
+async def summarize_text(text):
+    """Summarize the transcribed text using OpenAI's GPT model."""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": f"Summarize the following text in one sentence: {text}"}
+            ]
+        )
+        summary = response.choices[0].message['content'].strip()
+        logging.info(f"Generated summary: {summary}")
+        return summary
+    except Exception as e:
+        logging.error(f"An error occurred during text summarization: {e}")
+        return "Summary generation failed."
+
 
 # Routes
 @app.get("/", response_class=HTMLResponse)
@@ -95,37 +125,50 @@ async def create_upload_file(file: UploadFile = File(...), language: str = Form(
     with open(file_location, "wb+") as file_object:
         file_object.write(file.file.read())
 
-    # Extract lyrics from the uploaded file
-    lyrics = extract_lyrics_from_mp3(file_location, language)
-    return {"lyrics": lyrics}
+    # Convert MP3 to WAV
+    wav_file_location = f"converted_files/{file.filename.replace('.mp3', '.wav')}"
+    convert_mp3_to_wav(file_location, wav_file_location)
 
-@app.post("/reformat_lyrics/")
-async def reformat_lyrics(payload: LyricsPayload):
-    lyrics = payload.lyrics
-    formatted_lyrics = lyrics.replace("\n", " ").strip()
-    return {"formatted_lyrics": formatted_lyrics}
+    # Extract lyrics from the converted WAV file
+    lyrics = transcribe_wav_to_text(wav_file_location)
+    
+    # Clean up the uploaded MP3 file
+    os.remove(file_location)
+
+    # Summarize the transcribed text
+    summary = await summarize_text(lyrics)
+    
+    return {"lyrics": lyrics, "summary": summary}
 
 @app.post("/generate_image/")
 async def generate_image(payload: LyricsPayload):
     try:
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
+            logging.error("API key not found.")
             raise HTTPException(status_code=500, detail="API key not found.")
         
-        chatgpt_url = "https://api.openai.com/v1/images/generations"
+        dalle_url = "https://api.openai.com/v1/images/generations"
         
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
         
+        prompt = f"Generate an image based on this text summary: {payload.lyrics}"
+        if len(prompt) > 1000:
+            prompt = prompt[:1000]  # Truncate the prompt if it's longer than 1000 characters
+        
         data = {
-            "prompt": payload.lyrics,
+            "prompt": prompt,
             "size": "1024x1024",
             "n": 1
         }
         
-        response = requests.post(chatgpt_url, headers=headers, json=data)
+        logging.info(f"Sending request to OpenAI API with data: {data}")
+        response = requests.post(dalle_url, headers=headers, json=data)
+        logging.info(f"OpenAI API response status: {response.status_code}")
+        logging.info(f"OpenAI API response content: {response.text}")
         response.raise_for_status()
         
         image_url = response.json()['data'][0]['url']
@@ -139,9 +182,11 @@ async def generate_image(payload: LyricsPayload):
         image_path = os.path.join("media", "generated_image.png")
         image.save(image_path)
         
+        logging.info(f"Image saved at: {image_path}")
         return {"image_path": image_path}
     
     except requests.exceptions.RequestException as e:
+        logging.error(f"Request exception: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/media/generated_image.png")
